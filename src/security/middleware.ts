@@ -1,567 +1,524 @@
 /**
  * Security Middleware Integration
  * Unified security pipeline for Express/Fastify
+ * Ties together all security modules
  */
 
 import { Request, Response, NextFunction } from 'express';
-import { FastifyRequest, FastifyReply } from 'fastify';
-import {
-  distributedRateLimiter,
-  ddosProtection,
-  RateLimitResult,
-} from './rate-limiter';
+import { tenantIsolationManager } from './tenant-isolation';
+import { apiGateway } from './api-gateway';
+import { iamManager } from './iam';
+import { distributedRateLimiter, ddosProtection } from './rate-limiter';
 import {
   promptInjectionDetector,
   sqlInjectionPrevention,
   xssPrevention,
   csrfProtection,
   inputValidator,
-  InjectionDetectionResult,
 } from './injection-prevention';
 import { databaseRLS } from './database-rls';
-import { auditLogger } from './audit-logging';
 
+/**
+ * Security Context attached to request
+ */
 export interface SecurityContext {
   tenantId: string;
   userId: string;
   sessionId: string;
-  tier: 'standard' | 'enhanced' | 'dedicated';
   ipAddress: string;
   userAgent: string;
-}
-
-export interface SecurityMiddlewareConfig {
-  enableRateLimiting: boolean;
-  enableDDoSProtection: boolean;
-  enablePromptInjection: boolean;
-  enableSQLInjection: boolean;
-  enableXSS: boolean;
-  enableCSRF: boolean;
-  enableInputValidation: boolean;
-  enableAuditLogging: boolean;
+  roles: string[];
+  permissions: string[];
+  requestId: string;
+  timestamp: Date;
 }
 
 /**
- * Extract security context from request
+ * Extended Request with security context
  */
-export function extractSecurityContext(
-  req: Request | FastifyRequest
-): SecurityContext {
-  // Extract from JWT token or session
-  const token = req.headers.authorization?.replace('Bearer ', '');
-
-  // TODO: Decode JWT and extract claims
-  // const decoded = jwt.verify(token, JWT_SECRET);
-
-  return {
-    tenantId: (req as any).tenantId || 'unknown',
-    userId: (req as any).userId || 'unknown',
-    sessionId: (req as any).sessionId || 'unknown',
-    tier: (req as any).tier || 'standard',
-    ipAddress:
-      (req.headers['x-forwarded-for'] as string)?.split(',')[0] ||
-      (req as any).ip ||
-      'unknown',
-    userAgent: req.headers['user-agent'] || 'unknown',
-  };
+export interface SecureRequest extends Request {
+  security: SecurityContext;
+  dbConnection?: any;
 }
 
 /**
- * Master Security Middleware
- * Apply all security checks in order
+ * Security Middleware Manager
  */
-export function createSecurityMiddleware(
-  config: SecurityMiddlewareConfig = {
-    enableRateLimiting: true,
-    enableDDoSProtection: true,
-    enablePromptInjection: true,
-    enableSQLInjection: true,
-    enableXSS: true,
-    enableCSRF: true,
-    enableInputValidation: true,
-    enableAuditLogging: true,
-  }
-) {
-  return async (
-    req: Request,
+export class SecurityMiddleware {
+  /**
+   * Phase 1: Pre-Request Security Checks
+   * Must run before any business logic
+   */
+  async preRequestSecurity(
+    req: SecureRequest,
     res: Response,
     next: NextFunction
-  ): Promise<void> => {
+  ): Promise<void> {
     try {
-      const context = extractSecurityContext(req);
+      const requestId = this.generateRequestId();
       const startTime = Date.now();
 
-      // 1. DDoS Protection (first line of defense)
-      if (config.enableDDoSProtection) {
-        const ipCheck = await ddosProtection.checkIP(context.ipAddress);
-        if (!ipCheck.allowed) {
-          await auditLogger.logSecurityEvent({
-            tenantId: context.tenantId,
-            userId: context.userId,
-            eventType: 'DDOS_BLOCKED',
-            severity: 'CRITICAL',
-            details: {
-              ip: context.ipAddress,
-              reason: ipCheck.reason,
-              blockUntil: ipCheck.blockUntil,
-            },
-            timestamp: new Date(),
-            ipAddress: context.ipAddress,
-            userAgent: context.userAgent,
-          });
-
-          res.status(429).json({
-            error: 'Too Many Requests',
-            message: 'Your IP has been temporarily blocked',
-            reason: ipCheck.reason,
-            retryAfter: ipCheck.blockUntil,
-          });
-          return;
-        }
-
-        // Track request
-        await ddosProtection.trackIPRequest(context.ipAddress);
-      }
-
-      // 2. Rate Limiting
-      if (config.enableRateLimiting) {
-        const endpoint = req.path;
-        const rateLimitResult = await distributedRateLimiter.checkTenantRateLimit(
-          context.tenantId,
-          context.tier,
-          endpoint
-        );
-
-        // Set rate limit headers
-        res.setHeader('X-RateLimit-Limit', rateLimitResult.remaining + 1);
-        res.setHeader('X-RateLimit-Remaining', rateLimitResult.remaining);
-        res.setHeader(
-          'X-RateLimit-Reset',
-          rateLimitResult.resetAt.toISOString()
-        );
-
-        if (!rateLimitResult.allowed) {
-          await auditLogger.logSecurityEvent({
-            tenantId: context.tenantId,
-            userId: context.userId,
-            eventType: 'RATE_LIMIT_EXCEEDED',
-            severity: 'WARNING',
-            details: {
-              endpoint,
-              tier: context.tier,
-              retryAfter: rateLimitResult.retryAfterSeconds,
-            },
-            timestamp: new Date(),
-            ipAddress: context.ipAddress,
-            userAgent: context.userAgent,
-          });
-
-          res.status(429).json({
-            error: 'Rate Limit Exceeded',
-            message: `You have exceeded your ${context.tier} tier rate limit`,
-            retryAfter: rateLimitResult.retryAfterSeconds,
-            resetAt: rateLimitResult.resetAt,
-          });
-          return;
-        }
-      }
-
-      // 3. CSRF Protection (for state-changing operations)
-      if (
-        config.enableCSRF &&
-        ['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method)
-      ) {
-        const csrfToken = req.headers['x-csrf-token'] as string;
-        if (!csrfToken || !csrfProtection.validateToken(csrfToken, context.sessionId)) {
-          await auditLogger.logSecurityEvent({
-            tenantId: context.tenantId,
-            userId: context.userId,
-            eventType: 'CSRF_TOKEN_INVALID',
-            severity: 'HIGH',
-            details: {
-              method: req.method,
-              path: req.path,
-              hasToken: !!csrfToken,
-            },
-            timestamp: new Date(),
-            ipAddress: context.ipAddress,
-            userAgent: context.userAgent,
-          });
-
-          res.status(403).json({
-            error: 'Forbidden',
-            message: 'Invalid or missing CSRF token',
-          });
-          return;
-        }
-      }
-
-      // 4. Input Validation (on request body)
-      if (config.enableInputValidation && req.body) {
-        // Define schemas per endpoint
-        const schema = getEndpointSchema(req.path, req.method);
-        if (schema) {
-          const validation = inputValidator.validatePayload(req.body, schema);
-          if (!validation.isValid) {
-            await auditLogger.logSecurityEvent({
-              tenantId: context.tenantId,
-              userId: context.userId,
-              eventType: 'INPUT_VALIDATION_FAILED',
-              severity: 'MEDIUM',
-              details: {
-                errors: validation.errors,
-                path: req.path,
-              },
-              timestamp: new Date(),
-              ipAddress: context.ipAddress,
-              userAgent: context.userAgent,
-            });
-
-            res.status(400).json({
-              error: 'Validation Error',
-              message: 'Request validation failed',
-              errors: validation.errors,
-            });
-            return;
-          }
-        }
-      }
-
-      // 5. Prompt Injection Detection (for LLM endpoints)
-      if (config.enablePromptInjection && isLLMEndpoint(req.path)) {
-        const userInput = extractUserInput(req.body);
-        if (userInput) {
-          const injectionResult = promptInjectionDetector.detectInjection(
-            userInput
-          );
-
-          if (!injectionResult.isSafe) {
-            await auditLogger.logSecurityEvent({
-              tenantId: context.tenantId,
-              userId: context.userId,
-              eventType: 'PROMPT_INJECTION_DETECTED',
-              severity: 'CRITICAL',
-              details: {
-                threats: injectionResult.threats,
-                confidence: injectionResult.confidence,
-                input: userInput.substring(0, 200), // Log first 200 chars
-              },
-              timestamp: new Date(),
-              ipAddress: context.ipAddress,
-              userAgent: context.userAgent,
-            });
-
-            res.status(400).json({
-              error: 'Security Violation',
-              message: 'Potential prompt injection detected',
-              details: injectionResult.threats,
-            });
-            return;
-          }
-
-          // Use sanitized input if needed
-          if (injectionResult.sanitizedInput) {
-            (req.body as any)._sanitizedInput =
-              injectionResult.sanitizedInput;
-          }
-        }
-      }
-
-      // 6. SQL Injection Detection (for endpoints with database queries)
-      if (config.enableSQLInjection) {
-        const sqlInputs = extractPotentialSQLInputs(req.body, req.query);
-        for (const input of sqlInputs) {
-          const sqlResult = sqlInjectionPrevention.detectSQLInjection(input);
-          if (!sqlResult.isSafe) {
-            await auditLogger.logSecurityEvent({
-              tenantId: context.tenantId,
-              userId: context.userId,
-              eventType: 'SQL_INJECTION_DETECTED',
-              severity: 'CRITICAL',
-              details: {
-                threats: sqlResult.threats,
-                input: input.substring(0, 200),
-              },
-              timestamp: new Date(),
-              ipAddress: context.ipAddress,
-              userAgent: context.userAgent,
-            });
-
-            res.status(400).json({
-              error: 'Security Violation',
-              message: 'Potential SQL injection detected',
-            });
-            return;
-          }
-        }
-      }
-
-      // 7. Set Tenant Context for Database RLS
-      // This ensures all database queries are automatically filtered
-      (req as any).dbContext = await databaseRLS.setTenantContext(
-        context.tenantId,
-        (req as any).db
+      console.log(
+        `[SECURITY] ${requestId} - Starting security pipeline for ${req.method} ${req.path}`
       );
 
-      // 8. Audit Logging
-      if (config.enableAuditLogging) {
-        await auditLogger.logSecurityEvent({
-          tenantId: context.tenantId,
-          userId: context.userId,
-          eventType: 'API_REQUEST',
-          severity: 'INFO',
-          details: {
-            method: req.method,
-            path: req.path,
-            tier: context.tier,
-          },
-          timestamp: new Date(),
-          ipAddress: context.ipAddress,
-          userAgent: context.userAgent,
+      // Step 1: DDoS Protection - Check IP
+      const ipCheck = await ddosProtection.checkIP(
+        this.getClientIP(req)
+      );
+      if (!ipCheck.allowed) {
+        return this.sendSecurityError(res, 429, 'IP_BLOCKED', {
+          reason: ipCheck.reason,
+          blockUntil: ipCheck.blockUntil,
         });
       }
 
-      // Store context in request for downstream middleware
-      (req as any).securityContext = context;
+      // Track IP request
+      await ddosProtection.trackIPRequest(this.getClientIP(req));
 
-      // Continue to next middleware
-      next();
-    } catch (error) {
-      console.error('[SECURITY_MIDDLEWARE] Error:', error);
-      res.status(500).json({
-        error: 'Internal Server Error',
-        message: 'Security check failed',
-      });
-    }
-  };
-}
+      // Step 2: JWT Validation & Tenant Extraction
+      let tenantContext;
+      try {
+        const gatewayResult = await apiGateway.handleRequest(req);
+        tenantContext = gatewayResult.tenantContext;
 
-/**
- * XSS Protection Middleware (for responses)
- */
-export function xssProtectionMiddleware() {
-  return (req: Request, res: Response, next: NextFunction): void => {
-    const originalJson = res.json.bind(res);
+        // Add security headers to response
+        Object.entries(gatewayResult.headers).forEach(([key, value]) => {
+          res.setHeader(key, value);
+        });
+      } catch (error: any) {
+        return this.sendSecurityError(res, 401, 'UNAUTHORIZED', {
+          message: error.message,
+        });
+      }
 
-    res.json = function (body: any): Response {
-      // Sanitize response body to prevent XSS
-      const sanitized = sanitizeResponseBody(body);
-
-      // Set security headers
-      res.setHeader('X-Content-Type-Options', 'nosniff');
-      res.setHeader('X-Frame-Options', 'DENY');
-      res.setHeader('X-XSS-Protection', '1; mode=block');
-      res.setHeader(
-        'Content-Security-Policy',
-        "default-src 'self'; script-src 'self'; object-src 'none'"
+      // Step 3: Rate Limiting
+      const rateLimitResult = await distributedRateLimiter.checkTenantRateLimit(
+        tenantContext.tenantId,
+        tenantContext.isolationLevel,
+        req.path
       );
 
-      return originalJson(sanitized);
+      // Add rate limit headers
+      res.setHeader('X-RateLimit-Limit', rateLimitResult.remaining);
+      res.setHeader(
+        'X-RateLimit-Reset',
+        rateLimitResult.resetAt.toISOString()
+      );
+
+      if (!rateLimitResult.allowed) {
+        return this.sendSecurityError(res, 429, 'RATE_LIMIT_EXCEEDED', {
+          retryAfter: rateLimitResult.retryAfterSeconds,
+          resetAt: rateLimitResult.resetAt,
+        });
+      }
+
+      // Step 4: Check Concurrent Requests
+      const concurrentCheck = await distributedRateLimiter.checkConcurrentRequests(
+        tenantContext.tenantId,
+        tenantContext.isolationLevel
+      );
+
+      if (!concurrentCheck.allowed) {
+        return this.sendSecurityError(res, 429, 'TOO_MANY_CONCURRENT_REQUESTS', {
+          current: concurrentCheck.current,
+          max: concurrentCheck.max,
+        });
+      }
+
+      // Step 5: Build Security Context
+      const securityContext: SecurityContext = {
+        tenantId: tenantContext.tenantId,
+        userId: req.headers['x-user-id'] as string,
+        sessionId: req.headers['x-session-id'] as string || this.generateSessionId(),
+        ipAddress: this.getClientIP(req),
+        userAgent: req.headers['user-agent'] || '',
+        roles: [], // Will be populated from IAM
+        permissions: [],
+        requestId,
+        timestamp: new Date(),
+      };
+
+      // Get user and roles from IAM
+      if (securityContext.userId) {
+        const user = iamManager.getUser(securityContext.userId);
+        if (user) {
+          securityContext.roles = user.roles as string[];
+        }
+      }
+
+      // Attach security context to request
+      req.security = securityContext;
+
+      // Step 6: Set Database Tenant Context (RLS)
+      if (req.dbConnection) {
+        await databaseRLS.setTenantContext(
+          tenantContext.tenantId,
+          req.dbConnection
+        );
+      }
+
+      // Log security event
+      console.log(
+        `[SECURITY] ${requestId} - Pre-request checks passed (${Date.now() - startTime}ms)`
+      );
+
+      next();
+    } catch (error: any) {
+      console.error('[SECURITY] Pre-request security error:', error);
+      return this.sendSecurityError(res, 500, 'SECURITY_ERROR', {
+        message: error.message,
+      });
+    }
+  }
+
+  /**
+   * Phase 2: Request Validation
+   * Validates request body, query params, and headers
+   */
+  async validateRequest(
+    schema: Record<string, any>
+  ): Promise<(req: SecureRequest, res: Response, next: NextFunction) => void> {
+    return async (req: SecureRequest, res: Response, next: NextFunction) => {
+      try {
+        // Validate request body against schema
+        const validation = inputValidator.validatePayload(req.body, schema);
+
+        if (!validation.isValid) {
+          return this.sendSecurityError(res, 400, 'VALIDATION_ERROR', {
+            errors: validation.errors,
+          });
+        }
+
+        next();
+      } catch (error: any) {
+        return this.sendSecurityError(res, 400, 'VALIDATION_ERROR', {
+          message: error.message,
+        });
+      }
+    };
+  }
+
+  /**
+   * Phase 3: CSRF Protection
+   * Validates CSRF token on state-changing requests
+   */
+  async csrfProtection(
+    req: SecureRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
+    // Only check CSRF on mutating requests
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+      const token = req.headers['x-csrf-token'] as string;
+
+      if (!token) {
+        return this.sendSecurityError(res, 403, 'CSRF_TOKEN_MISSING');
+      }
+
+      const isValid = csrfProtection.validateToken(
+        token,
+        req.security.sessionId
+      );
+
+      if (!isValid) {
+        return this.sendSecurityError(res, 403, 'CSRF_TOKEN_INVALID');
+      }
+    }
+
+    next();
+  }
+
+  /**
+   * Phase 4: Injection Detection
+   * Scans all text inputs for injection attempts
+   */
+  async injectionDetection(
+    req: SecureRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
+    try {
+      // Check all string fields in body
+      const textInputs = this.extractTextInputs(req.body);
+
+      for (const input of textInputs) {
+        // Prompt injection detection
+        const promptCheck = promptInjectionDetector.detectInjection(input);
+        if (!promptCheck.isSafe) {
+          console.warn(
+            `[SECURITY] Prompt injection detected: ${promptCheck.threats.join(', ')}`
+          );
+          return this.sendSecurityError(res, 400, 'PROMPT_INJECTION_DETECTED', {
+            threats: promptCheck.threats,
+            confidence: promptCheck.confidence,
+          });
+        }
+
+        // SQL injection detection
+        const sqlCheck = sqlInjectionPrevention.detectSQLInjection(input);
+        if (!sqlCheck.isSafe) {
+          console.warn(
+            `[SECURITY] SQL injection detected: ${sqlCheck.threats.join(', ')}`
+          );
+          return this.sendSecurityError(res, 400, 'SQL_INJECTION_DETECTED', {
+            threats: sqlCheck.threats,
+          });
+        }
+
+        // XSS detection
+        const xssCheck = xssPrevention.detectXSS(input);
+        if (!xssCheck.isSafe) {
+          console.warn(
+            `[SECURITY] XSS detected: ${xssCheck.threats.join(', ')}`
+          );
+          return this.sendSecurityError(res, 400, 'XSS_DETECTED', {
+            threats: xssCheck.threats,
+          });
+        }
+      }
+
+      next();
+    } catch (error: any) {
+      console.error('[SECURITY] Injection detection error:', error);
+      next(); // Don't block request on detection error
+    }
+  }
+
+  /**
+   * Phase 5: Permission Check
+   * Verifies user has required permissions
+   */
+  requirePermission(
+    resource: string,
+    action: string
+  ): (req: SecureRequest, res: Response, next: NextFunction) => Promise<void> {
+    return async (req: SecureRequest, res: Response, next: NextFunction) => {
+      try {
+        const hasPermission = await iamManager.checkPermission(
+          req.security.userId,
+          resource,
+          action,
+          {
+            tenantId: req.security.tenantId,
+            ipAddress: req.security.ipAddress,
+          }
+        );
+
+        if (!hasPermission) {
+          return this.sendSecurityError(res, 403, 'INSUFFICIENT_PERMISSIONS', {
+            required: { resource, action },
+          });
+        }
+
+        next();
+      } catch (error: any) {
+        return this.sendSecurityError(res, 403, 'PERMISSION_CHECK_FAILED', {
+          message: error.message,
+        });
+      }
+    };
+  }
+
+  /**
+   * Phase 6: Post-Request Audit
+   * Logs request completion for compliance
+   */
+  async postRequestAudit(
+    req: SecureRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
+    // Hook into response finish event
+    const originalSend = res.send;
+    const self = this;
+
+    res.send = function (data: any) {
+      // Log audit event
+      self.logAuditEvent(req, res, data);
+
+      // Release concurrent request slot
+      distributedRateLimiter.releaseConcurrentSlot(req.security.tenantId);
+
+      return originalSend.call(this, data);
     };
 
     next();
-  };
-}
+  }
 
-/**
- * Concurrent Request Tracking Middleware
- */
-export function concurrentRequestMiddleware() {
-  return async (
-    req: Request,
+  /**
+   * Error Handler with Security Context
+   */
+  errorHandler(
+    err: any,
+    req: SecureRequest,
     res: Response,
     next: NextFunction
-  ): Promise<void> => {
-    const context = extractSecurityContext(req);
-
-    // Check concurrent request limit
-    const concurrentCheck = await distributedRateLimiter.checkConcurrentRequests(
-      context.tenantId,
-      context.tier
+  ): void {
+    console.error(
+      `[SECURITY] Error in request ${req.security?.requestId}:`,
+      err
     );
 
-    if (!concurrentCheck.allowed) {
-      res.status(429).json({
-        error: 'Too Many Concurrent Requests',
-        message: `Maximum ${concurrentCheck.max} concurrent requests allowed for ${context.tier} tier`,
-        current: concurrentCheck.current,
-      });
-      return;
+    // Log security-related errors
+    if (req.security) {
+      this.logSecurityError(req, err);
     }
-
-    // Release slot when request completes
-    res.on('finish', async () => {
-      await distributedRateLimiter.releaseConcurrentSlot(context.tenantId);
-    });
-
-    next();
-  };
-}
-
-/**
- * Helper: Check if endpoint is an LLM endpoint
- */
-function isLLMEndpoint(path: string): boolean {
-  return (
-    path.includes('/chat') ||
-    path.includes('/completion') ||
-    path.includes('/agent') ||
-    path.includes('/generate')
-  );
-}
-
-/**
- * Helper: Extract user input from request body
- */
-function extractUserInput(body: any): string | null {
-  if (!body) return null;
-
-  // Check common input fields
-  return (
-    body.prompt ||
-    body.message ||
-    body.input ||
-    body.query ||
-    body.text ||
-    null
-  );
-}
-
-/**
- * Helper: Extract potential SQL inputs
- */
-function extractPotentialSQLInputs(
-  body: any,
-  query: any
-): string[] {
-  const inputs: string[] = [];
-
-  // Extract from body
-  if (body) {
-    for (const value of Object.values(body)) {
-      if (typeof value === 'string') {
-        inputs.push(value);
-      }
-    }
-  }
-
-  // Extract from query params
-  if (query) {
-    for (const value of Object.values(query)) {
-      if (typeof value === 'string') {
-        inputs.push(value);
-      }
-    }
-  }
-
-  return inputs;
-}
-
-/**
- * Helper: Get validation schema for endpoint
- */
-function getEndpointSchema(
-  path: string,
-  method: string
-): Record<string, any> | null {
-  // Define schemas for each endpoint
-  const schemas: Record<string, Record<string, any>> = {
-    'POST:/api/chat': {
-      message: {
-        required: true,
-        type: 'string',
-        minLength: 1,
-        maxLength: 10000,
-      },
-      sessionId: {
-        required: false,
-        type: 'string',
-        pattern: /^[a-zA-Z0-9-_]+$/,
-      },
-    },
-    'POST:/api/agent/create': {
-      name: {
-        required: true,
-        type: 'string',
-        minLength: 1,
-        maxLength: 100,
-      },
-      type: {
-        required: true,
-        type: 'string',
-        enum: ['SIMPLE', 'CHAIN', 'GRAPH', 'SUPERVISOR'],
-      },
-    },
-  };
-
-  return schemas[`${method}:${path}`] || null;
-}
-
-/**
- * Helper: Sanitize response body
- */
-function sanitizeResponseBody(body: any): any {
-  if (typeof body === 'string') {
-    return xssPrevention.sanitizeHTML(body);
-  }
-
-  if (Array.isArray(body)) {
-    return body.map(sanitizeResponseBody);
-  }
-
-  if (typeof body === 'object' && body !== null) {
-    const sanitized: any = {};
-    for (const [key, value] of Object.entries(body)) {
-      sanitized[key] = sanitizeResponseBody(value);
-    }
-    return sanitized;
-  }
-
-  return body;
-}
-
-/**
- * Error Handling Middleware
- */
-export function securityErrorHandler() {
-  return async (
-    error: any,
-    req: Request,
-    res: Response,
-    next: NextFunction
-  ): Promise<void> => {
-    const context = extractSecurityContext(req);
-
-    // Log security error
-    await auditLogger.logSecurityEvent({
-      tenantId: context.tenantId,
-      userId: context.userId,
-      eventType: 'SECURITY_ERROR',
-      severity: 'HIGH',
-      details: {
-        error: error.message,
-        stack: error.stack,
-        path: req.path,
-      },
-      timestamp: new Date(),
-      ipAddress: context.ipAddress,
-      userAgent: context.userAgent,
-    });
 
     // Don't expose internal errors
-    res.status(500).json({
-      error: 'Internal Server Error',
-      message: 'An error occurred while processing your request',
+    const statusCode = err.statusCode || 500;
+    const message =
+      statusCode === 500 ? 'Internal server error' : err.message;
+
+    res.status(statusCode).json({
+      error: {
+        code: err.code || 'INTERNAL_ERROR',
+        message,
+        requestId: req.security?.requestId,
+      },
     });
-  };
+  }
+
+  /**
+   * Helper: Generate Request ID
+   */
+  private generateRequestId(): string {
+    return `req_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+  }
+
+  /**
+   * Helper: Generate Session ID
+   */
+  private generateSessionId(): string {
+    return `sess_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+  }
+
+  /**
+   * Helper: Get Client IP
+   */
+  private getClientIP(req: Request): string {
+    return (
+      (req.headers['x-forwarded-for'] as string)?.split(',')[0] ||
+      (req.headers['x-real-ip'] as string) ||
+      req.socket.remoteAddress ||
+      'unknown'
+    );
+  }
+
+  /**
+   * Helper: Extract text inputs from object
+   */
+  private extractTextInputs(obj: any, maxDepth = 3): string[] {
+    const inputs: string[] = [];
+
+    const extract = (value: any, depth: number) => {
+      if (depth > maxDepth) return;
+
+      if (typeof value === 'string' && value.length > 0) {
+        inputs.push(value);
+      } else if (Array.isArray(value)) {
+        value.forEach((item) => extract(item, depth + 1));
+      } else if (typeof value === 'object' && value !== null) {
+        Object.values(value).forEach((v) => extract(v, depth + 1));
+      }
+    };
+
+    extract(obj, 0);
+    return inputs;
+  }
+
+  /**
+   * Helper: Send Security Error Response
+   */
+  private sendSecurityError(
+    res: Response,
+    statusCode: number,
+    code: string,
+    details?: any
+  ): void {
+    res.status(statusCode).json({
+      error: {
+        code,
+        message: this.getErrorMessage(code),
+        ...details,
+      },
+    });
+  }
+
+  /**
+   * Helper: Get Error Message
+   */
+  private getErrorMessage(code: string): string {
+    const messages: Record<string, string> = {
+      IP_BLOCKED: 'Your IP address has been temporarily blocked',
+      UNAUTHORIZED: 'Authentication required',
+      RATE_LIMIT_EXCEEDED: 'Rate limit exceeded',
+      TOO_MANY_CONCURRENT_REQUESTS: 'Too many concurrent requests',
+      VALIDATION_ERROR: 'Request validation failed',
+      CSRF_TOKEN_MISSING: 'CSRF token is required',
+      CSRF_TOKEN_INVALID: 'Invalid CSRF token',
+      PROMPT_INJECTION_DETECTED: 'Potentially malicious input detected',
+      SQL_INJECTION_DETECTED: 'SQL injection attempt detected',
+      XSS_DETECTED: 'Cross-site scripting attempt detected',
+      INSUFFICIENT_PERMISSIONS: 'Insufficient permissions',
+      PERMISSION_CHECK_FAILED: 'Permission check failed',
+    };
+
+    return messages[code] || 'Security error';
+  }
+
+  /**
+   * Helper: Log Audit Event
+   */
+  private logAuditEvent(
+    req: SecureRequest,
+    res: Response,
+    responseData: any
+  ): void {
+    const auditLog = {
+      requestId: req.security.requestId,
+      tenantId: req.security.tenantId,
+      userId: req.security.userId,
+      method: req.method,
+      path: req.path,
+      statusCode: res.statusCode,
+      ipAddress: req.security.ipAddress,
+      userAgent: req.security.userAgent,
+      timestamp: new Date(),
+      duration: Date.now() - req.security.timestamp.getTime(),
+    };
+
+    console.log('[AUDIT]', JSON.stringify(auditLog));
+
+    // TODO: Send to audit logging system
+    // - Append to immutable log store
+    // - Send to SIEM (Splunk, Datadog)
+    // - Store in compliance database
+  }
+
+  /**
+   * Helper: Log Security Error
+   */
+  private logSecurityError(req: SecureRequest, error: any): void {
+    const errorLog = {
+      requestId: req.security.requestId,
+      tenantId: req.security.tenantId,
+      userId: req.security.userId,
+      error: error.message,
+      stack: error.stack,
+      timestamp: new Date(),
+    };
+
+    console.error('[SECURITY_ERROR]', JSON.stringify(errorLog));
+
+    // TODO: Alert security team if critical
+    // - Send to PagerDuty/Opsgenie
+    // - Slack notification
+    // - Email security@company.com
+  }
 }
 
 /**
- * Export middleware factory
+ * Export singleton instance
  */
-export const securityMiddleware = {
-  create: createSecurityMiddleware,
-  xssProtection: xssProtectionMiddleware,
-  concurrentRequests: concurrentRequestMiddleware,
-  errorHandler: securityErrorHandler,
-};
+export const securityMiddleware = new SecurityMiddleware();

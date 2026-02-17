@@ -1,290 +1,288 @@
 /**
- * Security Middleware Integration Example
- * Shows how to use security middleware in Express/Fastify
+ * Security Middleware Integration Examples
+ * Shows how to use security middleware in Express and Fastify
  */
 
 import express, { Express } from 'express';
-import { securityMiddleware } from './middleware';
+import { securityMiddleware, SecureRequest } from './middleware';
 import { csrfProtection } from './injection-prevention';
-import { agentSandbox, SANDBOX_CONFIGS } from './agent-sandbox';
 
 /**
  * Express Integration Example
  */
-export function createSecureExpressApp(): Express {
-  const app = express();
-
-  // 1. Parse request body
+export function setupExpressSecurity(app: Express): void {
+  // Global security middleware (applies to all routes)
   app.use(express.json({ limit: '10mb' }));
-  app.use(express.urlencoded({ extended: true }));
+  app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-  // 2. Apply security middleware (MUST be before routes)
+  // Phase 1: Pre-request security (DDoS, rate limiting, JWT validation)
   app.use(
-    securityMiddleware.create({
-      enableRateLimiting: true,
-      enableDDoSProtection: true,
-      enablePromptInjection: true,
-      enableSQLInjection: true,
-      enableXSS: true,
-      enableCSRF: true,
-      enableInputValidation: true,
-      enableAuditLogging: true,
-    })
+    securityMiddleware.preRequestSecurity.bind(securityMiddleware)
   );
 
-  // 3. Apply XSS protection for responses
-  app.use(securityMiddleware.xssProtection());
+  // Phase 2: CSRF protection (for state-changing requests)
+  app.use(
+    securityMiddleware.csrfProtection.bind(securityMiddleware)
+  );
 
-  // 4. Apply concurrent request tracking
-  app.use(securityMiddleware.concurrentRequests());
+  // Phase 3: Injection detection (prompt, SQL, XSS)
+  app.use(
+    securityMiddleware.injectionDetection.bind(securityMiddleware)
+  );
 
-  // 5. Define routes
-  app.post('/api/chat', async (req, res) => {
-    try {
-      const { message, sessionId } = req.body;
-      const context = (req as any).securityContext;
+  // Phase 4: Post-request audit logging
+  app.use(
+    securityMiddleware.postRequestAudit.bind(securityMiddleware)
+  );
 
-      // Use sanitized input if prompt injection was detected
-      const safeMessage = (req.body as any)._sanitizedInput || message;
-
-      // Process chat message
-      const response = await processChat({
-        message: safeMessage,
-        sessionId,
-        tenantId: context.tenantId,
-        userId: context.userId,
-      });
-
-      res.json({
-        success: true,
-        response,
-      });
-    } catch (error: any) {
-      res.status(500).json({
-        success: false,
-        error: error.message,
-      });
-    }
-  });
-
-  app.post('/api/agent/execute', async (req, res) => {
-    try {
-      const { agentId, code, language } = req.body;
-      const context = (req as any).securityContext;
-
-      // Create sandbox for agent execution
-      const sandbox = await agentSandbox.createSandbox(
-        context.tenantId,
-        agentId,
-        SANDBOX_CONFIGS[context.tier as keyof typeof SANDBOX_CONFIGS]
-      );
-
-      // Execute code in sandbox
-      const result = await agentSandbox.executeInSandbox(
-        sandbox.sandboxId,
-        code,
-        language
-      );
-
-      // Stop sandbox
-      await agentSandbox.stopSandbox(sandbox.sandboxId);
+  // Example protected route with input validation
+  app.post(
+    '/api/agents/create',
+    securityMiddleware.validateRequest({
+      name: {
+        required: true,
+        type: 'string',
+        minLength: 3,
+        maxLength: 100,
+      },
+      description: {
+        type: 'string',
+        maxLength: 500,
+      },
+      tools: {
+        type: 'object',
+      },
+    }),
+    securityMiddleware.requirePermission('agent', 'create'),
+    async (req: SecureRequest, res) => {
+      // Business logic here
+      // req.security contains authenticated user context
+      const { tenantId, userId } = req.security;
 
       res.json({
         success: true,
-        result,
-      });
-    } catch (error: any) {
-      res.status(500).json({
-        success: false,
-        error: error.message,
+        agent: {
+          id: 'agent_123',
+          name: req.body.name,
+          tenantId,
+          createdBy: userId,
+        },
       });
     }
+  );
+
+  // Example: Agent execution with prompt injection check
+  app.post(
+    '/api/agents/:agentId/execute',
+    securityMiddleware.validateRequest({
+      prompt: {
+        required: true,
+        type: 'string',
+        maxLength: 10000,
+      },
+      context: {
+        type: 'object',
+      },
+    }),
+    securityMiddleware.requirePermission('agent', 'execute'),
+    async (req: SecureRequest, res) => {
+      // Prompt injection is already checked in injectionDetection middleware
+      const { prompt, context } = req.body;
+
+      // Execute agent safely
+      res.json({
+        success: true,
+        result: 'Agent execution result',
+      });
+    }
+  );
+
+  // Example: Database query with SQL injection protection
+  app.get(
+    '/api/memories/search',
+    securityMiddleware.validateRequest({
+      query: {
+        required: true,
+        type: 'string',
+        maxLength: 1000,
+      },
+      limit: {
+        type: 'number',
+        min: 1,
+        max: 100,
+      },
+    }),
+    securityMiddleware.requirePermission('memory', 'read'),
+    async (req: SecureRequest, res) => {
+      // SQL injection is already checked
+      const { query, limit = 10 } = req.body;
+
+      // Use parameterized queries (handled by database-rls.ts)
+      res.json({
+        success: true,
+        results: [],
+      });
+    }
+  );
+
+  // Generate CSRF token for frontend
+  app.get('/api/csrf-token', async (req: SecureRequest, res) => {
+    const token = csrfProtection.generateToken(req.security.sessionId);
+    res.json({ csrfToken: token });
   });
 
-  // 6. CSRF token endpoint
-  app.get('/api/csrf-token', (req, res) => {
-    const context = (req as any).securityContext;
-    const token = csrfProtection.generateToken(context.sessionId);
-
-    res.json({
-      token,
-      expiresIn: 900, // 15 minutes
-    });
-  });
-
-  // 7. Health check (bypass security)
-  app.get('/health', (req, res) => {
-    res.json({ status: 'ok' });
-  });
-
-  // 8. Apply error handler (MUST be last)
-  app.use(securityMiddleware.errorHandler());
-
-  return app;
+  // Global error handler (must be last)
+  app.use(
+    securityMiddleware.errorHandler.bind(securityMiddleware)
+  );
 }
 
 /**
  * Fastify Integration Example
  */
-export async function createSecureFastifyApp() {
-  const fastify = require('fastify')({ logger: true });
-
-  // 1. Register plugins
-  await fastify.register(require('@fastify/cors'), {
-    origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'],
-    credentials: true,
-  });
-
-  await fastify.register(require('@fastify/helmet'), {
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        scriptSrc: ["'self'"],
-        objectSrc: ["'none'"],
-      },
-    },
-  });
-
-  // 2. Add security hooks
+export async function setupFastifySecurity(fastify: any): Promise<void> {
+  // Register global hooks
   fastify.addHook('onRequest', async (request: any, reply: any) => {
-    // Convert Fastify request to Express-like request
-    const expressReq = {
-      ...request,
-      body: request.body,
-      query: request.query,
-      params: request.params,
-      headers: request.headers,
+    // Convert Fastify request/reply to Express-like interface
+    const req: any = {
       method: request.method,
       path: request.url,
-      ip: request.ip,
+      headers: request.headers,
+      body: request.body,
+      query: request.query,
+      socket: request.socket,
     };
 
-    const expressRes = {
+    const res: any = {
+      setHeader: (key: string, value: string) => reply.header(key, value),
       status: (code: number) => {
         reply.code(code);
-        return expressRes;
+        return res;
       },
-      json: (data: any) => {
-        reply.send(data);
-      },
-      setHeader: (name: string, value: string) => {
-        reply.header(name, value);
-      },
+      json: (data: any) => reply.send(data),
+      send: (data: any) => reply.send(data),
     };
 
-    // Apply security middleware
-    const middleware = securityMiddleware.create();
-    await new Promise<void>((resolve, reject) => {
-      middleware(expressReq as any, expressRes as any, (error?: any) => {
-        if (error) reject(error);
-        else resolve();
-      });
-    });
+    const next = (err?: any) => {
+      if (err) throw err;
+    };
 
-    // Copy security context to Fastify request
-    request.securityContext = (expressReq as any).securityContext;
+    // Run security middleware
+    await securityMiddleware.preRequestSecurity(req, res, next);
+    await securityMiddleware.csrfProtection(req, res, next);
+    await securityMiddleware.injectionDetection(req, res, next);
+
+    // Attach security context to Fastify request
+    request.security = req.security;
   });
 
-  // 3. Define routes
-  fastify.post('/api/chat', async (request: any, reply: any) => {
-    const { message, sessionId } = request.body;
-    const context = request.securityContext;
-
-    const response = await processChat({
-      message,
-      sessionId,
-      tenantId: context.tenantId,
-      userId: context.userId,
-    });
-
-    return { success: true, response };
-  });
-
-  // 4. Error handler
-  fastify.setErrorHandler(async (error: any, request: any, reply: any) => {
-    const errorHandler = securityMiddleware.errorHandler();
-    await new Promise<void>((resolve) => {
-      errorHandler(
-        error,
-        request as any,
-        reply as any,
-        resolve as any
+  // Example protected route
+  fastify.post(
+    '/api/agents/create',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          required: ['name'],
+          properties: {
+            name: { type: 'string', minLength: 3, maxLength: 100 },
+            description: { type: 'string', maxLength: 500 },
+          },
+        },
+      },
+    },
+    async (request: any, reply: any) => {
+      // Check permissions
+      const hasPermission = await securityMiddleware.requirePermission(
+        'agent',
+        'create'
       );
+
+      if (!hasPermission) {
+        return reply.code(403).send({
+          error: { code: 'INSUFFICIENT_PERMISSIONS' },
+        });
+      }
+
+      // Business logic
+      const { tenantId, userId } = request.security;
+
+      return {
+        success: true,
+        agent: {
+          id: 'agent_123',
+          name: request.body.name,
+          tenantId,
+          createdBy: userId,
+        },
+      };
+    }
+  );
+
+  // Error handler
+  fastify.setErrorHandler((error: any, request: any, reply: any) => {
+    console.error('[SECURITY] Fastify error:', error);
+
+    const statusCode = error.statusCode || 500;
+    reply.code(statusCode).send({
+      error: {
+        code: error.code || 'INTERNAL_ERROR',
+        message: statusCode === 500 ? 'Internal server error' : error.message,
+        requestId: request.security?.requestId,
+      },
     });
   });
-
-  return fastify;
 }
 
 /**
- * Helper function to process chat
+ * Standalone Security Check Function
+ * For use in serverless functions, workers, etc.
  */
-async function processChat(params: {
-  message: string;
-  sessionId: string;
-  tenantId: string;
-  userId: string;
-}): Promise<string> {
-  // TODO: Implement actual chat processing
-  // - Load conversation history
-  // - Send to LLM
-  // - Store response
+export async function performSecurityCheck(
+  tenantId: string,
+  userId: string,
+  input: string,
+  resource: string,
+  action: string
+): Promise<{
+  allowed: boolean;
+  reason?: string;
+}> {
+  // Check rate limit
+  const rateLimitResult = await distributedRateLimiter.checkTenantRateLimit(
+    tenantId,
+    'standard', // Get from tenant context
+    resource
+  );
 
-  return `Echo: ${params.message}`;
-}
-
-/**
- * Start Express server
- */
-export async function startExpressServer(port = 3000) {
-  const app = createSecureExpressApp();
-
-  app.listen(port, () => {
-    console.log(`🔒 Secure Express server running on port ${port}`);
-    console.log('Security features enabled:');
-    console.log('  ✓ Rate Limiting (tier-based)');
-    console.log('  ✓ DDoS Protection (IP blocking)');
-    console.log('  ✓ Prompt Injection Detection');
-    console.log('  ✓ SQL Injection Prevention');
-    console.log('  ✓ XSS Protection');
-    console.log('  ✓ CSRF Token Validation');
-    console.log('  ✓ Input Validation');
-    console.log('  ✓ Audit Logging');
-  });
-
-  return app;
-}
-
-/**
- * Start Fastify server
- */
-export async function startFastifyServer(port = 3000) {
-  const app = await createSecureFastifyApp();
-
-  await app.listen({ port, host: '0.0.0.0' });
-
-  console.log(`🔒 Secure Fastify server running on port ${port}`);
-  console.log('Security features enabled:');
-  console.log('  ✓ Rate Limiting (tier-based)');
-  console.log('  ✓ DDoS Protection (IP blocking)');
-  console.log('  ✓ Prompt Injection Detection');
-  console.log('  ✓ SQL Injection Prevention');
-  console.log('  ✓ XSS Protection');
-  console.log('  ✓ CSRF Token Validation');
-  console.log('  ✓ Input Validation');
-  console.log('  ✓ Audit Logging');
-
-  return app;
-}
-
-// Run if executed directly
-if (require.main === module) {
-  const framework = process.env.FRAMEWORK || 'express';
-  const port = parseInt(process.env.PORT || '3000');
-
-  if (framework === 'fastify') {
-    startFastifyServer(port);
-  } else {
-    startExpressServer(port);
+  if (!rateLimitResult.allowed) {
+    return { allowed: false, reason: 'RATE_LIMIT_EXCEEDED' };
   }
+
+  // Check prompt injection
+  const promptCheck = promptInjectionDetector.detectInjection(input);
+  if (!promptCheck.isSafe) {
+    return {
+      allowed: false,
+      reason: 'PROMPT_INJECTION_DETECTED',
+    };
+  }
+
+  // Check permissions
+  const hasPermission = await iamManager.checkPermission(
+    userId,
+    resource,
+    action
+  );
+
+  if (!hasPermission) {
+    return { allowed: false, reason: 'INSUFFICIENT_PERMISSIONS' };
+  }
+
+  return { allowed: true };
 }
+
+// Import statements for standalone function
+import { distributedRateLimiter } from './rate-limiter';
+import { promptInjectionDetector } from './injection-prevention';
+import { iamManager } from './iam';
