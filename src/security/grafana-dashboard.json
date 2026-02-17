@@ -1,0 +1,118 @@
+{
+  "dashboard": {
+    "title": "OpenClaw Security Dashboard",
+    "tags": ["security", "openclaw"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "title": "Request Rate (req/s)",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(openclaw_http_request_total[5m])",
+            "legendFormat": "{{method}} {{route}}"
+          }
+        ]
+      },
+      {
+        "title": "Request Latency (p95)",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(openclaw_http_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "p95"
+          }
+        ]
+      },
+      {
+        "title": "Rate Limit Violations",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(openclaw_rate_limit_exceeded_total[5m])",
+            "legendFormat": "{{tenant_id}} - {{tier}}"
+          }
+        ]
+      },
+      {
+        "title": "Security Events",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(openclaw_prompt_injection_detected_total[5m])",
+            "legendFormat": "Prompt Injection"
+          },
+          {
+            "expr": "rate(openclaw_sql_injection_detected_total[5m])",
+            "legendFormat": "SQL Injection"
+          },
+          {
+            "expr": "rate(openclaw_xss_attempt_detected_total[5m])",
+            "legendFormat": "XSS Attempt"
+          }
+        ]
+      },
+      {
+        "title": "Blocked IPs",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "openclaw_ip_blocked_total"
+          }
+        ]
+      },
+      {
+        "title": "Authentication Success Rate",
+        "type": "gauge",
+        "targets": [
+          {
+            "expr": "rate(openclaw_auth_success_total[5m]) / (rate(openclaw_auth_success_total[5m]) + rate(openclaw_auth_failure_total[5m]))"
+          }
+        ]
+      },
+      {
+        "title": "Active Tenants",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "openclaw_active_tenants"
+          }
+        ]
+      },
+      {
+        "title": "Agent Execution Time",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(openclaw_agent_execution_duration_seconds_bucket[5m]))",
+            "legendFormat": "{{tenant_id}}"
+          }
+        ]
+      },
+      {
+        "title": "Sandbox Kill Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(openclaw_agent_sandbox_killed_total[5m])",
+            "legendFormat": "{{reason}}"
+          }
+        ]
+      },
+      {
+        "title": "API Calls by Tenant",
+        "type": "table",
+        "targets": [
+          {
+            "expr": "topk(10, sum by (tenant_id, tier) (rate(openclaw_tenant_api_calls_total[1h])))"
+          }
+        ]
+      }
+    ],
+    "refresh": "30s",
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    }
+  }
+}
