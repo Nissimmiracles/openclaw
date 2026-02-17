@@ -1,286 +1,270 @@
 /**
  * Security Monitoring & Metrics
- * Prometheus metrics exporter and Grafana dashboards
+ * Prometheus metrics and real-time alerting
  */
 
-import { Registry, Counter, Histogram, Gauge } from 'prom-client';
+import { securityConfig } from './config';
 
-export class SecurityMetrics {
-  private registry: Registry;
+export interface SecurityMetrics {
+  // Request metrics
+  totalRequests: number;
+  requestsPerSecond: number;
+  averageLatencyMs: number;
 
-  // Rate Limiting Metrics
-  public rateLimitExceeded: Counter;
-  public rateLimitAllowed: Counter;
+  // Security events
+  rateLimitViolations: number;
+  ddosBlockedIPs: number;
+  promptInjectionDetected: number;
+  sqlInjectionDetected: number;
+  xssDetected: number;
+  csrfFailures: number;
+  unauthorizedAccess: number;
 
-  // DDoS Protection Metrics
-  public ipBlockedTotal: Counter;
-  public suspiciousIPDetected: Counter;
+  // Authentication
+  loginAttempts: number;
+  loginSuccesses: number;
+  loginFailures: number;
+  mfaEnabled: number;
 
-  // Injection Detection Metrics
-  public promptInjectionDetected: Counter;
-  public sqlInjectionDetected: Counter;
-  public xssAttemptDetected: Counter;
-  public csrfTokenInvalid: Counter;
+  // Tenant metrics
+  activeTenants: number;
+  activeUsers: number;
+  activeSessions: number;
 
-  // Authentication Metrics
-  public authSuccess: Counter;
-  public authFailure: Counter;
-  public tokenGenerated: Counter;
-  public tokenExpired: Counter;
+  // Resource usage
+  cpuUsagePercent: number;
+  memoryUsageMB: number;
+  diskUsageMB: number;
+}
 
-  // Request Metrics
-  public httpRequestDuration: Histogram;
-  public httpRequestTotal: Counter;
-  public httpRequestErrors: Counter;
+/**
+ * Monitoring Dashboard
+ */
+export class SecurityMonitoring {
+  private metrics: SecurityMetrics = {
+    totalRequests: 0,
+    requestsPerSecond: 0,
+    averageLatencyMs: 0,
+    rateLimitViolations: 0,
+    ddosBlockedIPs: 0,
+    promptInjectionDetected: 0,
+    sqlInjectionDetected: 0,
+    xssDetected: 0,
+    csrfFailures: 0,
+    unauthorizedAccess: 0,
+    loginAttempts: 0,
+    loginSuccesses: 0,
+    loginFailures: 0,
+    mfaEnabled: 0,
+    activeTenants: 0,
+    activeUsers: 0,
+    activeSessions: 0,
+    cpuUsagePercent: 0,
+    memoryUsageMB: 0,
+    diskUsageMB: 0,
+  };
 
-  // Tenant Metrics
-  public activeTenants: Gauge;
-  public tenantApiCalls: Counter;
+  private requestLatencies: number[] = [];
 
-  // Agent Metrics
-  public agentExecutionDuration: Histogram;
-  public agentSandboxCreated: Counter;
-  public agentSandboxKilled: Counter;
+  /**
+   * Record request
+   */
+  recordRequest(latencyMs: number): void {
+    this.metrics.totalRequests++;
+    this.requestLatencies.push(latencyMs);
 
-  // Audit Metrics
-  public auditEventsTotal: Counter;
-  public securityEventsTotal: Counter;
+    // Keep only last 1000 latencies
+    if (this.requestLatencies.length > 1000) {
+      this.requestLatencies.shift();
+    }
 
-  constructor() {
-    this.registry = new Registry();
+    // Calculate average latency
+    this.metrics.averageLatencyMs =
+      this.requestLatencies.reduce((a, b) => a + b, 0) /
+      this.requestLatencies.length;
+  }
 
-    // Rate Limiting
-    this.rateLimitExceeded = new Counter({
-      name: 'openclaw_rate_limit_exceeded_total',
-      help: 'Total number of rate limit violations',
-      labelNames: ['tenant_id', 'endpoint', 'tier'],
-      registers: [this.registry],
+  /**
+   * Record security event
+   */
+  recordSecurityEvent(eventType: string): void {
+    switch (eventType) {
+      case 'RATE_LIMIT_EXCEEDED':
+        this.metrics.rateLimitViolations++;
+        break;
+      case 'DDOS_BLOCKED':
+        this.metrics.ddosBlockedIPs++;
+        break;
+      case 'PROMPT_INJECTION_DETECTED':
+        this.metrics.promptInjectionDetected++;
+        break;
+      case 'SQL_INJECTION_DETECTED':
+        this.metrics.sqlInjectionDetected++;
+        break;
+      case 'XSS_DETECTED':
+        this.metrics.xssDetected++;
+        break;
+      case 'CSRF_TOKEN_INVALID':
+        this.metrics.csrfFailures++;
+        break;
+      case 'UNAUTHORIZED_ACCESS':
+        this.metrics.unauthorizedAccess++;
+        break;
+      case 'LOGIN_SUCCESS':
+        this.metrics.loginAttempts++;
+        this.metrics.loginSuccesses++;
+        break;
+      case 'LOGIN_FAILED':
+        this.metrics.loginAttempts++;
+        this.metrics.loginFailures++;
+        break;
+    }
+  }
+
+  /**
+   * Get current metrics
+   */
+  getMetrics(): SecurityMetrics {
+    return { ...this.metrics };
+  }
+
+  /**
+   * Export Prometheus metrics
+   */
+  exportPrometheusMetrics(): string {
+    return `
+# HELP openclaw_requests_total Total number of requests
+# TYPE openclaw_requests_total counter
+openclaw_requests_total ${this.metrics.totalRequests}
+
+# HELP openclaw_request_latency_ms Average request latency in milliseconds
+# TYPE openclaw_request_latency_ms gauge
+openclaw_request_latency_ms ${this.metrics.averageLatencyMs}
+
+# HELP openclaw_security_events_total Security events by type
+# TYPE openclaw_security_events_total counter
+openclaw_security_events_total{type="rate_limit"} ${this.metrics.rateLimitViolations}
+openclaw_security_events_total{type="ddos"} ${this.metrics.ddosBlockedIPs}
+openclaw_security_events_total{type="prompt_injection"} ${this.metrics.promptInjectionDetected}
+openclaw_security_events_total{type="sql_injection"} ${this.metrics.sqlInjectionDetected}
+openclaw_security_events_total{type="xss"} ${this.metrics.xssDetected}
+openclaw_security_events_total{type="csrf"} ${this.metrics.csrfFailures}
+openclaw_security_events_total{type="unauthorized"} ${this.metrics.unauthorizedAccess}
+
+# HELP openclaw_login_attempts_total Total login attempts
+# TYPE openclaw_login_attempts_total counter
+openclaw_login_attempts_total{result="success"} ${this.metrics.loginSuccesses}
+openclaw_login_attempts_total{result="failure"} ${this.metrics.loginFailures}
+
+# HELP openclaw_active_tenants Number of active tenants
+# TYPE openclaw_active_tenants gauge
+openclaw_active_tenants ${this.metrics.activeTenants}
+
+# HELP openclaw_active_users Number of active users
+# TYPE openclaw_active_users gauge
+openclaw_active_users ${this.metrics.activeUsers}
+
+# HELP openclaw_active_sessions Number of active sessions
+# TYPE openclaw_active_sessions gauge
+openclaw_active_sessions ${this.metrics.activeSessions}
+    `.trim();
+  }
+
+  /**
+   * Start metrics server
+   */
+  startMetricsServer(): void {
+    if (!securityConfig.monitoring.enabled) {
+      console.log('[MONITORING] Metrics disabled');
+      return;
+    }
+
+    const express = require('express');
+    const app = express();
+
+    app.get('/metrics', (req: any, res: any) => {
+      res.set('Content-Type', 'text/plain');
+      res.send(this.exportPrometheusMetrics());
     });
 
-    this.rateLimitAllowed = new Counter({
-      name: 'openclaw_rate_limit_allowed_total',
-      help: 'Total number of allowed requests',
-      labelNames: ['tenant_id', 'endpoint'],
-      registers: [this.registry],
+    app.get('/health', (req: any, res: any) => {
+      res.json({ status: 'healthy', timestamp: new Date() });
     });
 
-    // DDoS Protection
-    this.ipBlockedTotal = new Counter({
-      name: 'openclaw_ip_blocked_total',
-      help: 'Total number of IPs blocked',
-      labelNames: ['reason'],
-      registers: [this.registry],
-    });
-
-    this.suspiciousIPDetected = new Counter({
-      name: 'openclaw_suspicious_ip_detected_total',
-      help: 'Total number of suspicious IPs detected',
-      registers: [this.registry],
-    });
-
-    // Injection Detection
-    this.promptInjectionDetected = new Counter({
-      name: 'openclaw_prompt_injection_detected_total',
-      help: 'Total number of prompt injection attempts',
-      labelNames: ['tenant_id', 'confidence'],
-      registers: [this.registry],
-    });
-
-    this.sqlInjectionDetected = new Counter({
-      name: 'openclaw_sql_injection_detected_total',
-      help: 'Total number of SQL injection attempts',
-      labelNames: ['tenant_id'],
-      registers: [this.registry],
-    });
-
-    this.xssAttemptDetected = new Counter({
-      name: 'openclaw_xss_attempt_detected_total',
-      help: 'Total number of XSS attempts',
-      labelNames: ['tenant_id'],
-      registers: [this.registry],
-    });
-
-    this.csrfTokenInvalid = new Counter({
-      name: 'openclaw_csrf_token_invalid_total',
-      help: 'Total number of invalid CSRF tokens',
-      labelNames: ['tenant_id'],
-      registers: [this.registry],
-    });
-
-    // Authentication
-    this.authSuccess = new Counter({
-      name: 'openclaw_auth_success_total',
-      help: 'Total number of successful authentications',
-      labelNames: ['tenant_id'],
-      registers: [this.registry],
-    });
-
-    this.authFailure = new Counter({
-      name: 'openclaw_auth_failure_total',
-      help: 'Total number of failed authentications',
-      labelNames: ['tenant_id', 'reason'],
-      registers: [this.registry],
-    });
-
-    this.tokenGenerated = new Counter({
-      name: 'openclaw_token_generated_total',
-      help: 'Total number of tokens generated',
-      labelNames: ['tenant_id', 'type'],
-      registers: [this.registry],
-    });
-
-    this.tokenExpired = new Counter({
-      name: 'openclaw_token_expired_total',
-      help: 'Total number of expired tokens',
-      labelNames: ['tenant_id'],
-      registers: [this.registry],
-    });
-
-    // Requests
-    this.httpRequestDuration = new Histogram({
-      name: 'openclaw_http_request_duration_seconds',
-      help: 'HTTP request latency in seconds',
-      labelNames: ['method', 'route', 'status_code', 'tenant_id'],
-      buckets: [0.1, 0.5, 1, 2, 5, 10],
-      registers: [this.registry],
-    });
-
-    this.httpRequestTotal = new Counter({
-      name: 'openclaw_http_request_total',
-      help: 'Total number of HTTP requests',
-      labelNames: ['method', 'route', 'status_code'],
-      registers: [this.registry],
-    });
-
-    this.httpRequestErrors = new Counter({
-      name: 'openclaw_http_request_errors_total',
-      help: 'Total number of HTTP request errors',
-      labelNames: ['method', 'route', 'error_type'],
-      registers: [this.registry],
-    });
-
-    // Tenants
-    this.activeTenants = new Gauge({
-      name: 'openclaw_active_tenants',
-      help: 'Number of active tenants',
-      registers: [this.registry],
-    });
-
-    this.tenantApiCalls = new Counter({
-      name: 'openclaw_tenant_api_calls_total',
-      help: 'Total API calls per tenant',
-      labelNames: ['tenant_id', 'tier'],
-      registers: [this.registry],
-    });
-
-    // Agents
-    this.agentExecutionDuration = new Histogram({
-      name: 'openclaw_agent_execution_duration_seconds',
-      help: 'Agent execution duration in seconds',
-      labelNames: ['tenant_id', 'agent_id'],
-      buckets: [1, 5, 10, 30, 60, 300],
-      registers: [this.registry],
-    });
-
-    this.agentSandboxCreated = new Counter({
-      name: 'openclaw_agent_sandbox_created_total',
-      help: 'Total number of agent sandboxes created',
-      labelNames: ['tenant_id', 'tier'],
-      registers: [this.registry],
-    });
-
-    this.agentSandboxKilled = new Counter({
-      name: 'openclaw_agent_sandbox_killed_total',
-      help: 'Total number of agent sandboxes killed',
-      labelNames: ['tenant_id', 'reason'],
-      registers: [this.registry],
-    });
-
-    // Audit
-    this.auditEventsTotal = new Counter({
-      name: 'openclaw_audit_events_total',
-      help: 'Total number of audit events',
-      labelNames: ['tenant_id', 'event_type'],
-      registers: [this.registry],
-    });
-
-    this.securityEventsTotal = new Counter({
-      name: 'openclaw_security_events_total',
-      help: 'Total number of security events',
-      labelNames: ['tenant_id', 'severity'],
-      registers: [this.registry],
+    const port = securityConfig.monitoring.metricsPort;
+    app.listen(port, () => {
+      console.log(`📊 [MONITORING] Metrics server running on port ${port}`);
+      console.log(`   Prometheus: http://localhost:${port}/metrics`);
+      console.log(`   Health: http://localhost:${port}/health`);
     });
   }
 
   /**
-   * Get metrics in Prometheus format
+   * Send alert
    */
-  async getMetrics(): Promise<string> {
-    return this.registry.metrics();
+  async sendAlert(severity: 'INFO' | 'WARNING' | 'CRITICAL', message: string): Promise<void> {
+    console.log(`🚨 [ALERT] ${severity}: ${message}`);
+
+    // Send to Slack
+    if (securityConfig.monitoring.slackWebhook) {
+      await this.sendSlackAlert(severity, message);
+    }
+
+    // Send to PagerDuty (CRITICAL only)
+    if (severity === 'CRITICAL' && securityConfig.monitoring.pagerDutyKey) {
+      await this.sendPagerDutyAlert(message);
+    }
   }
 
   /**
-   * Get registry for custom metrics
+   * Send Slack alert
    */
-  getRegistry(): Registry {
-    return this.registry;
+  private async sendSlackAlert(severity: string, message: string): Promise<void> {
+    const color = severity === 'CRITICAL' ? 'danger' : severity === 'WARNING' ? 'warning' : 'good';
+
+    const payload = {
+      attachments: [
+        {
+          color,
+          title: `Security Alert: ${severity}`,
+          text: message,
+          ts: Math.floor(Date.now() / 1000),
+        },
+      ],
+    };
+
+    // TODO: Send to Slack webhook
+    // await fetch(securityConfig.monitoring.slackWebhook!, {
+    //   method: 'POST',
+    //   headers: { 'Content-Type': 'application/json' },
+    //   body: JSON.stringify(payload),
+    // });
+  }
+
+  /**
+   * Send PagerDuty alert
+   */
+  private async sendPagerDutyAlert(message: string): Promise<void> {
+    const payload = {
+      routing_key: securityConfig.monitoring.pagerDutyKey,
+      event_action: 'trigger',
+      payload: {
+        summary: message,
+        severity: 'critical',
+        source: 'openclaw-security',
+      },
+    };
+
+    // TODO: Send to PagerDuty
+    // await fetch('https://events.pagerduty.com/v2/enqueue', {
+    //   method: 'POST',
+    //   headers: { 'Content-Type': 'application/json' },
+    //   body: JSON.stringify(payload),
+    // });
   }
 }
 
 /**
  * Export singleton instance
  */
-export const securityMetrics = new SecurityMetrics();
-
-/**
- * Metrics middleware for Express/Fastify
- */
-export function metricsMiddleware() {
-  return async (req: any, res: any, next: any) => {
-    const start = Date.now();
-
-    // Track request
-    res.on('finish', () => {
-      const duration = (Date.now() - start) / 1000;
-      const tenantId = req.securityContext?.tenantId || 'unknown';
-
-      // Record duration
-      securityMetrics.httpRequestDuration.observe(
-        {
-          method: req.method,
-          route: req.path,
-          status_code: res.statusCode,
-          tenant_id: tenantId,
-        },
-        duration
-      );
-
-      // Record total
-      securityMetrics.httpRequestTotal.inc({
-        method: req.method,
-        route: req.path,
-        status_code: res.statusCode,
-      });
-
-      // Record errors
-      if (res.statusCode >= 400) {
-        securityMetrics.httpRequestErrors.inc({
-          method: req.method,
-          route: req.path,
-          error_type:
-            res.statusCode >= 500 ? 'server_error' : 'client_error',
-        });
-      }
-
-      // Record tenant API calls
-      if (tenantId !== 'unknown') {
-        securityMetrics.tenantApiCalls.inc({
-          tenant_id: tenantId,
-          tier: req.securityContext?.tier || 'standard',
-        });
-      }
-    });
-
-    next();
-  };
-}
+export const securityMonitoring = new SecurityMonitoring();
