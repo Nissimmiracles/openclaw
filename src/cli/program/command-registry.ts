@@ -50,19 +50,6 @@ const coreEntries: CoreCliEntry[] = [
     },
   },
   {
-    commands: [{ name: "interactive", description: "Open interactive command selector" }],
-    register: ({ program }) => {
-      program
-        .command("interactive")
-        .description("Open interactive command selector")
-        .action(() => {
-          // Normal interactive entrypoint is handled before parse in run-main.
-          // Keep this command visible in --help and provide a sensible fallback.
-          program.outputHelp();
-        });
-    },
-  },
-  {
     commands: [{ name: "config", description: "Config helpers" }],
     register: async ({ program }) => {
       const mod = await import("../config-cli.js");
